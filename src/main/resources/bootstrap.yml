@@ -1,0 +1,84 @@
+# Bootstrap configuration for Product Management & Availability Shred
+# This file contains early application startup configurations
+# Loaded before application.yml for service discovery and configuration management
+
+spring:
+  application:
+    name: product-management-availability-shred-g5ds
+  
+  # Cloud configuration for distributed systems
+  cloud:
+    config:
+      enabled: false  # Disable Spring Cloud Config for standalone operation
+      
+  # Profile-specific configuration loading
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
+    
+  # Configuration properties encryption (if needed)
+  config:
+    use-legacy-processing: false
+    
+# Logging configuration for bootstrap phase
+logging:
+  level:
+    org.springframework.boot: WARN
+    org.springframework.cloud: WARN
+    ai.shreds.product_management_availability_shred_g5ds: INFO
+  pattern:
+    console: '%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [BOOTSTRAP] %logger{36} - %msg%n'
+    
+# Management endpoints for health checks during startup
+management:
+  endpoints:
+    enabled-by-default: false
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      enabled: true
+      show-details: never
+      
+# Server configuration for early binding
+server:
+  port: ${SERVER_PORT:8080}
+  servlet:
+    context-path: /api/v1
+    
+# Environment-specific overrides
+---
+spring:
+  config:
+    activate:
+      on-profile: dev
+      
+logging:
+  level:
+    ai.shreds.product_management_availability_shred_g5ds: DEBUG
+    
+---
+spring:
+  config:
+    activate:
+      on-profile: test
+      
+server:
+  port: 0  # Random port for testing
+  
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+      
+logging:
+  level:
+    root: WARN
+    ai.shreds.product_management_availability_shred_g5ds: INFO
+    
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
