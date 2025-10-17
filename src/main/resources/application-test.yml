@@ -1,0 +1,284 @@
+# Test configuration for Product Management & Availability Shred
+# Optimized for integration testing with embedded databases and mock services
+
+spring:
+  application:
+    name: product-management-availability-shred-g5ds-test
+  profiles:
+    active: test
+  
+  # Test database configuration with H2 in-memory database
+  datasource:
+    url: jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;MODE=PostgreSQL
+    username: sa
+    password: 
+    driver-class-name: org.h2.Driver
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 1
+      idle-timeout: 300000
+      max-lifetime: 600000
+      connection-timeout: 5000
+  
+  # H2 Console for debugging (test only)
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+      settings:
+        web-allow-others: false
+  
+  # JPA configuration for testing
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.H2Dialect
+        format_sql: true
+        jdbc:
+          batch_size: 20
+    defer-datasource-initialization: true
+    open-in-view: false
+  
+  # Disable Flyway for tests (using create-drop)
+  flyway:
+    enabled: false
+  
+  # Test SQL data initialization
+  sql:
+    init:
+      mode: embedded
+      schema-locations: classpath:sql/test-schema.sql
+      data-locations: classpath:sql/test-data.sql
+      continue-on-error: false
+  
+  # Embedded Redis for testing
+  redis:
+    host: localhost
+    port: 6370  # Different port to avoid conflicts
+    timeout: 1000ms
+    jedis:
+      pool:
+        max-active: 5
+        max-idle: 2
+        min-idle: 1
+        max-wait: 1000ms
+  
+  # Cache configuration for testing
+  cache:
+    type: redis
+    redis:
+      time-to-live: 60000  # 1 minute for tests
+      cache-null-values: false
+      key-prefix: "test:product-catalog:"
+  
+  # Embedded ActiveMQ for testing
+  activemq:
+    broker-url: vm://embedded?broker.persistent=false&broker.useShutdownHook=false
+    user: 
+    password: 
+    pool:
+      enabled: false
+    packages:
+      trust-all: true
+  
+  # JMS configuration for testing
+  jms:
+    template:
+      default-destination: product.events.test
+      delivery-delay: 0
+      delivery-mode: non_persistent
+      priority: 4
+      time-to-live: 60000
+      receive-timeout: 1000
+    listener:
+      auto-startup: true
+      acknowledge-mode: auto
+      concurrency: 1-2
+
+# Management endpoints for testing
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"
+    enabled-by-default: true
+  endpoint:
+    health:
+      show-details: always
+      show-components: always
+    metrics:
+      enabled: true
+  health:
+    redis:
+      enabled: false  # May not be available in all test environments
+    db:
+      enabled: true
+    jms:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: false  # Disable for tests
+
+# Logging configuration for testing
+logging:
+  level:
+    root: WARN
+    ai.shreds.product_management_availability_shred_g5ds: DEBUG
+    org.springframework.web: DEBUG
+    org.hibernate.SQL: DEBUG
+    org.hibernate.type.descriptor.sql.BasicBinder: TRACE
+    org.springframework.jms: INFO
+    org.springframework.cache: DEBUG
+    org.springframework.test: INFO
+    org.testcontainers: INFO
+  pattern:
+    console: '%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n'
+
+# Server configuration for testing (random port)
+server:
+  port: 0
+  servlet:
+    context-path: /api/v1
+  tomcat:
+    max-threads: 10
+    min-spare-threads: 2
+
+# Product-specific test configuration
+product:
+  availability:
+    cache:
+      ttl: 30  # 30 seconds for tests
+      max-entries: 100
+    sync:
+      inventory-service-url: http://localhost:${wiremock.server.port:8089}/api/v1/inventory
+      poll-interval: 5000  # 5 seconds for faster tests
+      retry-attempts: 2
+      circuit-breaker:
+        failure-rate-threshold: 50
+        wait-duration: 5000
+        sliding-window-size: 5
+        minimum-number-of-calls: 3
+      timeout: 5000
+      read-timeout: 3000
+      connection-timeout: 2000
+  
+  # JMS queue configuration for testing
+  jms:
+    queues:
+      availability-changes: product.availability.changes.test
+      seasonal-updates: seasonal.offerings.updates.test
+      inventory-updates: inventory.status.updates.test
+      product-restock: product.restock.notifications.test
+      product-created: product.created.test
+      product-updated: product.updated.test
+    dead-letter:
+      enabled: false  # Disable for simpler testing
+
+# Test-specific configuration
+test:
+  database:
+    cleanup: true
+    isolation: true
+  cache:
+    clear-before-test: true
+  jms:
+    purge-queues: true
+  mock-services:
+    inventory-service:
+      enabled: true
+      port: 8089
+    external-apis:
+      enabled: false
+
+# WireMock configuration for external service mocking
+wiremock:
+  server:
+    port: 8089
+    files:
+      mappings: classpath:wiremock/mappings
+      root: classpath:wiremock/__files
+
+# TestContainers configuration (if using)
+testcontainers:
+  reuse:
+    enable: true
+
+# Security configuration for testing
+security:
+  require-ssl: false
+
+# Application-specific test configuration
+app:
+  version: test-${random.value}
+  environment: test
+  features:
+    circuit-breaker-enabled: true
+    cache-enabled: true
+    metrics-enabled: false
+    audit-enabled: false
+  rate-limiting:
+    enabled: false
+
+# External service mock configuration
+external:
+  inventory-service:
+    base-url: http://localhost:${wiremock.server.port:8089}
+    timeout: 5s
+    retry:
+      max-attempts: 2
+      backoff-delay: 1s
+      max-delay: 3s
+    circuit-breaker:
+      enabled: true
+      failure-rate: 50
+      slow-call-rate: 30
+      slow-call-duration: 2s
+      wait-duration: 5s
+
+# Spring Boot Test configuration
+spring.test:
+  database:
+    replace: none  # Don't replace our configured H2 database
+  mockmvc:
+    print: none
+  webdriver:
+    scope: singleton
+
+---
+# Profile for integration tests with real external dependencies
+spring:
+  config:
+    activate:
+      on-profile: integration-test
+      
+  # Use TestContainers for PostgreSQL
+  datasource:
+    url: jdbc:tc:postgresql:13:///testdb?TC_REUSABLE=true
+    driver-class-name: org.testcontainers.jdbc.ContainerDatabaseDriver
+  
+  # Enable Flyway for integration tests
+  flyway:
+    enabled: true
+    locations: classpath:db/migration,classpath:db/test-data
+  
+  sql:
+    init:
+      mode: never  # Let Flyway handle schema creation
+      
+test:
+  containers:
+    postgresql:
+      enabled: true
+    redis:
+      enabled: true
+    activemq:
+      enabled: true
+      
+logging:
+  level:
+    org.testcontainers: INFO
+    com.github.dockerjava: WARN
