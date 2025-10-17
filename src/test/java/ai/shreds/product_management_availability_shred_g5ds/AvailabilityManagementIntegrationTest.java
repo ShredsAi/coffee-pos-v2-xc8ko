@@ -1,6 +1,7 @@
 package ai.shreds.product_management_availability_shred_g5ds;
 
 import ai.shreds.product_management_availability_shred_g5ds.application.ApplicationDTOAvailabilityUpdate;
+import ai.shreds.product_management_availability_shred_g5ds.application.services.ApplicationServiceInventorySync;
 import ai.shreds.product_management_availability_shred_g5ds.shared.SharedEnumUnavailableReason;
 import ai.shreds.product_management_availability_shred_g5ds.shared.dtos.SharedAvailabilityDTO;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -63,6 +64,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * - Database persistence of availability changes
  * - Redis cache synchronization for availability data
  * - JMS AvailabilityChangedEvent publishing
+ * - External inventory service synchronization
  * - End-to-end workflow from REST request to database, cache, and messaging
  * 
  * Uses TestContainers for real PostgreSQL and Redis instances.
@@ -99,6 +101,9 @@ public class AvailabilityManagementIntegrationTest {
 
     @Autowired
     private ObjectMapper objectMapper;
+    
+    @Autowired
+    private ApplicationServiceInventorySync inventorySyncService;
 
     // TestContainers for Infrastructure Dependencies
     @Container
@@ -135,6 +140,8 @@ public class AvailabilityManagementIntegrationTest {
         // External Service Mock Configuration
         registry.add("product.availability.sync.inventory-service-url", 
                 () -> "http://localhost:" + wireMockServer.port() + "/api/v1/inventory");
+        registry.add("inventory.service.url", 
+                () -> "http://localhost:" + wireMockServer.port());
         
         // JMS Configuration (use embedded broker)
         registry.add("spring.activemq.broker-url", () -> "vm://localhost?broker.persistent=false");
@@ -181,7 +188,7 @@ public class AvailabilityManagementIntegrationTest {
      */
     private void setupExternalServiceMocks() {
         // Mock inventory service health check
-        wireMockServer.stubFor(get(urlPathEqualTo("/api/v1/inventory/health"))
+        wireMockServer.stubFor(get(urlPathEqualTo("/health"))
                 .willReturn(aResponse()
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
@@ -194,6 +201,22 @@ public class AvailabilityManagementIntegrationTest {
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"locationId\": \"test-location-123\", \"inventoryData\": [], \"timestamp\": \"2024-01-15T10:00:00Z\"}"))
+        );
+        
+        // Mock inventory status endpoint for POST requests
+        wireMockServer.stubFor(post(urlPathEqualTo("/api/v1/inventory/status"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"locationId\": \"test-location-123\", \"inventoryData\": [], \"timestamp\": \"2024-01-15T10:00:00Z\"}"))
+        );
+
+        // Mock all locations inventory status endpoint
+        wireMockServer.stubFor(get(urlPathEqualTo("/api/v1/inventory/status/all"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{}"))
         );
 
         logger.info("External service mocks configured successfully");
@@ -396,6 +419,144 @@ public class AvailabilityManagementIntegrationTest {
     }
     
     /**
+     * Integration Test: Test external inventory synchronization workflow
+     * This test verifies that external inventory service data correctly updates local availability records
+     */
+    @Test
+    @Transactional
+    void When_Inventory_Sync_Runs_Then_External_Service_Data_Updates_Local_Availability(CapturedOutput output) throws Exception {
+        logger.info("=== STARTING INVENTORY SYNCHRONIZATION INTEGRATION TEST ===");
+        
+        // Step 1: Create test data for inventory sync
+        TestDataSetup testData = createTestDataForInventorySyncTest();
+        logger.info("✓ Test data created - Product: {}, Location: {}, Availability: {}", 
+                testData.productId, testData.locationId, testData.availabilityId);
+        
+        // Step 2: Configure WireMock to return specific inventory data
+        String mockInventoryResponse = String.format("""
+            {
+                "locationId": "%s",
+                "inventoryData": [
+                    {
+                        "productId": "%s",
+                        "currentStock": 75,
+                        "isAvailable": true,
+                        "lastUpdated": "%s"
+                    }
+                ],
+                "timestamp": "%s"
+            }
+            """, testData.locationId.toString(), testData.productId.toString(), 
+                    LocalDateTime.now().toString(), LocalDateTime.now().toString());
+        
+        // Update WireMock stub to return our test data
+        wireMockServer.stubFor(post(urlPathEqualTo("/api/v1/inventory/status"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody(mockInventoryResponse)));
+        
+        // Also stub the all locations endpoint for broader scope sync
+        String allLocationsResponse = String.format("""
+            {
+                "%s": {
+                    "%s": 75
+                }
+            }
+            """, testData.locationId.toString(), testData.productId.toString());
+            
+        wireMockServer.stubFor(get(urlPathEqualTo("/api/v1/inventory/status/all"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody(allLocationsResponse)));
+        
+        logger.info("✓ WireMock configured with inventory data - Stock: 75, Available: true");
+        
+        // Step 3: Capture initial availability state
+        String initialQuery = "SELECT is_available, estimated_quantity FROM product_availability WHERE availability_id = ?";
+        List<Map<String, Object>> initialState = jdbcTemplate.queryForList(initialQuery, testData.availabilityId);
+        assertFalse(initialState.isEmpty(), "Initial availability record should exist");
+        
+        boolean initialAvailable = (Boolean) initialState.get(0).get("is_available");
+        Integer initialQuantity = (Integer) initialState.get(0).get("estimated_quantity");
+        logger.info("✓ Initial availability state - Available: {}, Quantity: {}", initialAvailable, initialQuantity);
+        
+        // Step 4: Trigger inventory synchronization for specific location
+        logger.info("Starting inventory synchronization for location: {}", testData.locationId);
+        
+        try {
+            inventorySyncService.syncInventoryForLocation(testData.locationId);
+            logger.info("✓ Inventory sync completed without exceptions");
+        } catch (Exception e) {
+            logger.error("Inventory sync failed with exception", e);
+            fail("Inventory synchronization should not fail: " + e.getMessage());
+        }
+        
+        // Step 5: Allow some time for async processing
+        Thread.sleep(2000);
+        
+        // Step 6: Verify WireMock received the request
+        wireMockServer.verify(postRequestedFor(urlPathEqualTo("/api/v1/inventory/status"))
+                .withRequestBody(containing(testData.locationId.toString())));
+        logger.info("✓ External inventory service was called correctly");
+        
+        // Step 7: Verify database was updated with external data
+        String updatedQuery = "SELECT is_available, estimated_quantity, last_updated FROM product_availability WHERE availability_id = ?";
+        List<Map<String, Object>> updatedState = jdbcTemplate.queryForList(updatedQuery, testData.availabilityId);
+        
+        assertFalse(updatedState.isEmpty(), "Updated availability record should exist in database");
+        Map<String, Object> dbRecord = updatedState.get(0);
+        
+        Boolean updatedAvailable = (Boolean) dbRecord.get("is_available");
+        Integer updatedQuantity = (Integer) dbRecord.get("estimated_quantity");
+        Object lastUpdated = dbRecord.get("last_updated");
+        
+        // Verify the data was updated based on external service response
+        assertTrue(updatedAvailable, "Product should be available based on external inventory data");
+        assertEquals(75, updatedQuantity, "Quantity should match external inventory data");
+        assertNotNull(lastUpdated, "Last updated timestamp should be set");
+        
+        logger.info("✓ Database updated correctly - Available: {}, Quantity: {}, LastUpdated: {}", 
+                updatedAvailable, updatedQuantity, lastUpdated);
+        
+        // Step 8: Verify cache was updated (if caching is implemented)
+        String cacheKey = "availability:" + testData.locationId + ":" + testData.productId;
+        Object cachedData = redisTemplate.opsForValue().get(cacheKey);
+        if (cachedData != null) {
+            logger.info("✓ Cache was updated with new availability data: {}", cachedData);
+        } else {
+            logger.info("✓ No cached data found (cache may have different key pattern or TTL expired)");
+        }
+        
+        // Step 9: Verify application logs show sync process
+        String logOutput = output.getOut();
+        assertTrue(logOutput.contains("Starting inventory sync") || 
+                   logOutput.contains("inventory sync") ||
+                   logOutput.contains("Inventory sync"),
+                "Logs should show inventory synchronization process");
+        
+        // Step 10: Test health check to ensure service is still working
+        wireMockServer.verify(getRequestedFor(urlPathEqualTo("/health")));
+        logger.info("✓ Health check was performed on inventory service");
+        
+        // Step 11: Verify the change represents actual synchronization
+        if (initialQuantity.equals(updatedQuantity) && initialAvailable.equals(updatedAvailable)) {
+            logger.warn("Initial and updated states are the same - sync may not have occurred or data was already in sync");
+        } else {
+            logger.info("✓ Availability state changed from initial values, confirming sync occurred");
+        }
+        
+        logger.info("=== INVENTORY SYNCHRONIZATION INTEGRATION TEST COMPLETED SUCCESSFULLY ===");
+        logger.info("✓ External inventory service was called correctly");
+        logger.info("✓ Local availability data was updated with external data");
+        logger.info("✓ Database persistence confirmed");
+        logger.info("✓ Cache synchronization checked");
+        logger.info("✓ End-to-end inventory sync workflow verified");
+        logger.info("✓ All assertions passed");
+    }
+    
+    /**
      * Helper class to hold test data
      */
     private static class TestDataSetup {
@@ -442,6 +603,48 @@ public class AvailabilityManagementIntegrationTest {
             """;
         jdbcTemplate.update(insertAvailabilitySql, testData.availabilityId, 
                 testData.productId, testData.locationId, true, 50);
+        
+        return testData;
+    }
+    
+    /**
+     * Helper method to create test data specifically for inventory sync testing
+     */
+    private TestDataSetup createTestDataForInventorySyncTest() {
+        TestDataSetup testData = new TestDataSetup();
+        
+        // Create test category
+        testData.categoryId = UUID.randomUUID();
+        String insertCategorySql = """
+            INSERT INTO product_categories (category_id, name, description, display_order, is_active)
+            VALUES (?, ?, ?, ?, ?)
+            """;
+        jdbcTemplate.update(insertCategorySql, testData.categoryId, "Inventory Sync Category", 
+                "Category for inventory sync testing", 1, true);
+        
+        // Create test product
+        testData.productId = UUID.randomUUID();
+        String insertProductSql = """
+            INSERT INTO products (product_id, name, description, product_type, category_id, 
+                                base_price_amount, base_price_currency, is_active, created_at, last_modified)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """;
+        jdbcTemplate.update(insertProductSql, testData.productId, "Test Product for Inventory Sync", 
+                "Test product for inventory sync integration testing", "BEVERAGE", 
+                testData.categoryId, new BigDecimal("4.50"), "USD", true);
+        
+        // Create test location (simulated as UUID)
+        testData.locationId = UUID.randomUUID();
+        
+        // Create initial availability record with different values than what external service will return
+        testData.availabilityId = UUID.randomUUID();
+        String insertAvailabilitySql = """
+            INSERT INTO product_availability (availability_id, product_id, location_id, 
+                                            is_available, estimated_quantity, last_updated)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """;
+        jdbcTemplate.update(insertAvailabilitySql, testData.availabilityId, 
+                testData.productId, testData.locationId, false, 10); // Different from external service response
         
         return testData;
     }
